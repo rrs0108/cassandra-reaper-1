@@ -41,7 +41,7 @@ import com.spotify.reaper.service.RingRange;
 import com.spotify.reaper.service.SegmentGenerator;
 import java.util.UUID;
 
-public class CommonTools {
+public final class CommonTools {
 
   private static final Logger LOG = LoggerFactory.getLogger(CommonTools.class);
 
@@ -70,20 +70,29 @@ public class CommonTools {
 
     Map<String, RingRange> nodes = getClusterNodes(context, cluster, repairUnit);
     // the next step is to prepare a repair run object
-    RepairRun repairRun = storeNewRepairRun(context, cluster, repairUnit, cause, owner, nodes.keySet().size(),
-                                            repairParallelism, intensity);
-    checkNotNull(repairRun, "failed preparing repair run");
-
-    // Notice that our RepairRun core object doesn't contain pointer to
-    // the set of RepairSegments in the run, as they are accessed separately.
-    // However, RepairSegment has a pointer to the RepairRun it lives in
+    segments = repairUnit.getIncrementalRepair() ? nodes.keySet().size() : tokenSegments.size();
+    
+    RepairRun.Builder runBuilder 
+            = createNewRepairRun(cluster, repairUnit, cause, owner, segments, repairParallelism, intensity);
 
     // the last preparation step is to generate actual repair segments
-    if(!repairUnit.getIncrementalRepair()) {
-      return storeNewRepairSegments(context, tokenSegments, repairRun, repairUnit);
-    } else {
-      return storeNewRepairSegmentsForIncrementalRepair(context, nodes, repairRun, repairUnit);
+    List<RepairSegment.Builder> segmentBuilders = repairUnit.getIncrementalRepair()
+            ? createRepairSegmentsForIncrementalRepair(nodes, repairUnit)
+            : createRepairSegments(tokenSegments, repairUnit);
+
+    RepairRun repairRun = context.storage.addRepairRun(runBuilder, segmentBuilders);
+
+    if (null == repairRun){
+      String errMsg = String.format(
+              "failed storing repair run for cluster \"%s\", keyspace \"%s\", and column families: %s",
+              cluster.getName(),
+              repairUnit.getKeyspaceName(),
+              repairUnit.getColumnFamilies());
+      
+      LOG.error(errMsg);
+      throw new ReaperException(errMsg);
     }
+    return repairRun;
   }
 
   /**
@@ -133,51 +142,29 @@ public class CommonTools {
    * @return the new, just stored RepairRun instance
    * @throws ReaperException when fails to store the RepairRun.
    */
-  private static RepairRun storeNewRepairRun(AppContext context, Cluster cluster,
-                                             RepairUnit repairUnit, Optional<String> cause,
-                                             String owner, int segments,
-                                             RepairParallelism repairParallelism, Double intensity)
-      throws ReaperException {
-    RepairRun.Builder runBuilder = new RepairRun.Builder(cluster.getName(), repairUnit.getId(),
-                                                         DateTime.now(), intensity,
-                                                         segments, repairParallelism);
-    runBuilder.cause(cause.isPresent() ? cause.get() : "no cause specified");
-    runBuilder.owner(owner);
-    RepairRun newRepairRun = context.storage.addRepairRun(runBuilder);
-    if (newRepairRun == null) {
-      String errMsg = String.format("failed storing repair run for cluster \"%s\", "
-                                    + "keyspace \"%s\", and column families: %s",
-                                    cluster.getName(), repairUnit.getKeyspaceName(),
-                                    repairUnit.getColumnFamilies());
-      LOG.error(errMsg);
-      throw new ReaperException(errMsg);
-    }
-    return newRepairRun;
+  private static RepairRun.Builder createNewRepairRun(
+          Cluster cluster,
+          RepairUnit repairUnit,
+          Optional<String> cause,
+          String owner,
+          int segments,
+          RepairParallelism repairParallelism,
+          Double intensity) throws ReaperException {
+
+    return new RepairRun.Builder(cluster.getName(), repairUnit.getId(), DateTime.now(), intensity, segments, repairParallelism)
+            .cause(cause.isPresent() ? cause.get() : "no cause specified")
+            .owner(owner);
   }
 
   /**
    * Creates the repair runs linked to given RepairRun and stores them directly in the storage
    * backend.
    */
-  private static RepairRun storeNewRepairSegments(AppContext context, List<RingRange> tokenSegments,
-                                             RepairRun repairRun, RepairUnit repairUnit) {
+  private static List<RepairSegment.Builder> createRepairSegments(List<RingRange> tokenSegments, RepairUnit repairUnit){
+
     List<RepairSegment.Builder> repairSegmentBuilders = Lists.newArrayList();
-    for (RingRange range : tokenSegments) {
-      RepairSegment.Builder repairSegment = new RepairSegment.Builder(repairRun.getId(), range,
-                                                                      repairUnit.getId());
-      repairSegmentBuilders.add(repairSegment);
-    }
-    context.storage.addRepairSegments(repairSegmentBuilders, repairRun.getId());
-    if (repairRun.getSegmentCount() != tokenSegments.size()) {
-      LOG.debug("created segment amount differs from expected default {} != {}",
-                repairRun.getSegmentCount(), tokenSegments.size());
-      RepairRun newRepairRun = repairRun.with().segmentCount(tokenSegments.size()).build(repairRun.getId());
-      context.storage.updateRepairRun(newRepairRun);
-      
-      return newRepairRun;
-    }
-    
-    return repairRun;
+    tokenSegments.forEach(range -> repairSegmentBuilders.add(new RepairSegment.Builder(range, repairUnit.getId())));
+    return repairSegmentBuilders;
   }
   
   
@@ -185,26 +172,17 @@ public class CommonTools {
    * Creates the repair runs linked to given RepairRun and stores them directly in the storage
    * backend in case of incrementalRepair
    */
-  private static RepairRun storeNewRepairSegmentsForIncrementalRepair(AppContext context, Map<String, RingRange> nodes,
-                                             RepairRun repairRun, RepairUnit repairUnit) {
+  private static List<RepairSegment.Builder> createRepairSegmentsForIncrementalRepair(
+          Map<String, RingRange> nodes,
+          RepairUnit repairUnit) {
+
     List<RepairSegment.Builder> repairSegmentBuilders = Lists.newArrayList();
-    for (Entry<String, RingRange> range : nodes.entrySet()) {
-      RepairSegment.Builder repairSegment = new RepairSegment.Builder(repairRun.getId(), range.getValue(),
-                                                                      repairUnit.getId());
-      repairSegment.coordinatorHost(range.getKey());
-      repairSegmentBuilders.add(repairSegment);
-    }
-    context.storage.addRepairSegments(repairSegmentBuilders, repairRun.getId());
-    if (repairRun.getSegmentCount() != nodes.keySet().size()) {
-      LOG.debug("created segment amount differs from expected default {} != {}",
-                repairRun.getSegmentCount(), nodes.keySet().size());
-      RepairRun newRepairRun = repairRun.with().segmentCount(nodes.keySet().size()).build(repairRun.getId());
-      context.storage.updateRepairRun(newRepairRun);
-      
-      return newRepairRun;
-    }
-    
-    return repairRun;
+
+    nodes.entrySet().forEach(range
+            -> repairSegmentBuilders.add(
+                new RepairSegment.Builder(range.getValue(), repairUnit.getId()).coordinatorHost(range.getKey())));
+
+    return repairSegmentBuilders;
   }
   
   private static Map<String, RingRange> getClusterNodes(AppContext context,  Cluster targetCluster, RepairUnit repairUnit) throws ReaperException {
@@ -377,5 +355,7 @@ public class CommonTools {
   public static Set<String> parseSeedHosts(String seedHost) {
     return Arrays.stream(seedHost.split(",")).map(String::trim).collect(Collectors.toSet());
   }
+
+  private CommonTools(){}
 
 }
